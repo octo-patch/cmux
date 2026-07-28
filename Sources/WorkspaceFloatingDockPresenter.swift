@@ -7,7 +7,10 @@ final class WorkspaceFloatingDockPresenter {
     private weak var tabManager: TabManager?
     private var controllers: [UUID: WorkspaceFloatingDockWindowController] = [:]
     private var lastActiveDockId: UUID?
+    private var stashedDockOrder: [UUID] = []
+    private var revealedStashedDockId: UUID?
     private var localMouseMonitor: Any?
+    private var globalMouseMonitor: Any?
 
     init(parentWindow: NSWindow, tabManager: TabManager) {
         self.parentWindow = parentWindow
@@ -88,21 +91,21 @@ final class WorkspaceFloatingDockPresenter {
                         controller.cascade(relativeTo: sourceWindow)
                     }
                 }
-                guard !dock.isStashed else {
-                    controller.showStashed(
-                        visibleScreenFrame: visibleScreenFrame(),
-                        animated: false
-                    )
-                    continue
+                if !dock.isStashed {
+                    controller.show(focus: focusDockId == dock.id)
                 }
-                controller.show(focus: focusDockId == dock.id)
             }
-            workspaceDocks
+            applyParkingLayout(
+                to: workspaceDocks
                 .filter(\.isStashed)
                 .sorted {
                     ($0.stashedAt ?? 0) < ($1.stashedAt ?? 0)
-                }
-                .forEach { controllers[$0.id]?.orderStashedWindowFront() }
+                },
+                animatedDockId: nil
+            )
+        } else {
+            stashedDockOrder.removeAll()
+            revealedStashedDockId = nil
         }
     }
 
@@ -113,6 +116,12 @@ final class WorkspaceFloatingDockPresenter {
             NSEvent.removeMonitor(localMouseMonitor)
             self.localMouseMonitor = nil
         }
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
+            self.globalMouseMonitor = nil
+        }
+        stashedDockOrder.removeAll()
+        revealedStashedDockId = nil
     }
 
     func animateStash(_ dock: WorkspaceFloatingDock) {
@@ -121,13 +130,17 @@ final class WorkspaceFloatingDockPresenter {
             refresh()
             return
         }
-        guard let controller = controllers[dock.id],
-              let visibleScreenFrame = visibleScreenFrame() else {
+        guard controllers[dock.id] != nil else {
             refresh()
             return
         }
-        controller.stash(
-            visibleScreenFrame: visibleScreenFrame
+        applyParkingLayout(
+            to: workspace.floatingDocks
+                .filter(\.isStashed)
+                .sorted {
+                    ($0.stashedAt ?? 0) < ($1.stashedAt ?? 0)
+                },
+            animatedDockId: dock.id
         ) { [weak self] in
             self?.refresh()
         }
@@ -139,9 +152,20 @@ final class WorkspaceFloatingDockPresenter {
 
     @discardableResult
     func reconcileScreenConfiguration() -> Bool {
-        return controllers.values.reduce(true) { reconciled, controller in
+        let reconciled = controllers.values.reduce(true) { reconciled, controller in
             controller.reconcileScreenConfiguration() && reconciled
         }
+        if reconciled, let workspace = tabManager?.selectedWorkspace {
+            applyParkingLayout(
+                to: workspace.floatingDocks
+                    .filter(\.isStashed)
+                    .sorted {
+                        ($0.stashedAt ?? 0) < ($1.stashedAt ?? 0)
+                    },
+                animatedDockId: nil
+            )
+        }
+        return reconciled
     }
 
     func isAttached(to window: NSWindow) -> Bool {
@@ -206,6 +230,90 @@ final class WorkspaceFloatingDockPresenter {
         return workspace.floatingDocks.last(where: { $0.id != dockId && !$0.isStashed })?.id
     }
 
+    private func applyParkingLayout(
+        to docks: [WorkspaceFloatingDock],
+        animatedDockId: UUID?,
+        completion: (() -> Void)? = nil
+    ) {
+        guard let fallbackVisibleScreenFrame = visibleScreenFrame() else {
+            docks.forEach { controllers[$0.id]?.hide() }
+            stashedDockOrder.removeAll()
+            revealedStashedDockId = nil
+            completion?()
+            return
+        }
+
+        let liveIds = Set(docks.map(\.id))
+        if let revealedStashedDockId, !liveIds.contains(revealedStashedDockId) {
+            controllers[revealedStashedDockId]?.setParkingRevealed(false)
+            self.revealedStashedDockId = nil
+        }
+
+        var entries: [(
+            dock: WorkspaceFloatingDock,
+            controller: WorkspaceFloatingDockWindowController,
+            restoreFrame: CGRect,
+            visibleScreenFrame: CGRect
+        )] = []
+        entries.reserveCapacity(docks.count)
+        for dock in docks {
+            guard let controller = controllers[dock.id],
+                  let request = controller.parkingRequest(
+                    fallbackVisibleScreenFrame: fallbackVisibleScreenFrame
+                  ) else {
+                controllers[dock.id]?.hide()
+                continue
+            }
+            entries.append((
+                dock: dock,
+                controller: controller,
+                restoreFrame: request.restoreFrame,
+                visibleScreenFrame: request.visibleScreenFrame
+            ))
+        }
+        stashedDockOrder = entries.map { $0.dock.id }
+
+        var didStartRequestedAnimation = false
+        var remainingEntries = entries
+        while let first = remainingEntries.first {
+            let screenFrame = first.visibleScreenFrame
+            let group = remainingEntries.filter { $0.visibleScreenFrame == screenFrame }
+            remainingEntries.removeAll { $0.visibleScreenFrame == screenFrame }
+            let snapshots = WorkspaceFloatingDockParkingSnapshot.arranged(
+                restoreFrames: group.map(\.restoreFrame),
+                visibleScreenFrame: screenFrame
+            )
+            for (entry, snapshot) in zip(group, snapshots) {
+                if entry.dock.id == animatedDockId {
+                    didStartRequestedAnimation = true
+                    entry.controller.stash(snapshot: snapshot) {
+                        completion?()
+                    }
+                } else {
+                    entry.controller.showStashed(
+                        snapshot: snapshot,
+                        animated: animatedDockId != nil
+                    )
+                }
+            }
+        }
+
+        for dockId in stashedDockOrder {
+            controllers[dockId]?.setParkingRevealed(dockId == revealedStashedDockId)
+        }
+        orderStashedWindows()
+        if animatedDockId != nil, !didStartRequestedAnimation {
+            completion?()
+        }
+    }
+
+    private func orderStashedWindows() {
+        stashedDockOrder.forEach { controllers[$0]?.orderStashedWindowFront() }
+        if let revealedStashedDockId {
+            controllers[revealedStashedDockId]?.orderStashedWindowFront()
+        }
+    }
+
     private func visibleScreenFrame() -> CGRect? {
         parentWindow?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame
     }
@@ -219,12 +327,34 @@ final class WorkspaceFloatingDockPresenter {
             }
             return event
         }
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: eventMask) {
+            [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.updateStashedWindowHover()
+            }
+        }
     }
 
     private func updateStashedWindowHover() {
         let mouseLocation = NSEvent.mouseLocation
-        controllers.values.forEach {
-            $0.updateStashedPointer(at: mouseLocation)
+        let nextRevealedDockId: UUID?
+        if let revealedStashedDockId,
+           controllers[revealedStashedDockId]?.containsParkingRevealedPoint(mouseLocation) == true {
+            nextRevealedDockId = revealedStashedDockId
+        } else {
+            nextRevealedDockId = stashedDockOrder.reversed().first {
+                controllers[$0]?.containsParkingRestingPoint(mouseLocation) == true
+            }
         }
+        guard nextRevealedDockId != revealedStashedDockId else { return }
+
+        if let revealedStashedDockId {
+            controllers[revealedStashedDockId]?.setParkingRevealed(false)
+        }
+        revealedStashedDockId = nextRevealedDockId
+        if let nextRevealedDockId {
+            controllers[nextRevealedDockId]?.setParkingRevealed(true)
+        }
+        orderStashedWindows()
     }
 }

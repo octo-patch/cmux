@@ -121,20 +121,88 @@ struct WorkspaceFloatingDockParkingRegressionTests {
         let regularWindow = CGRect(x: 240, y: 180, width: 620, height: 420)
         let narrowWindow = CGRect(x: 240, y: 180, width: 80, height: 420)
 
-        let regularParked = WorkspaceFloatingDockStashLayout.stashedWindowFrame(
-            windowFrame: regularWindow,
-            visibleScreenFrame: screen,
-            isHovered: false
-        )
-        let narrowParked = WorkspaceFloatingDockStashLayout.stashedWindowFrame(
-            windowFrame: narrowWindow,
-            visibleScreenFrame: screen,
-            isHovered: false
-        )
+        let regularParked = WorkspaceFloatingDockParkingSnapshot(
+            restoreFrame: regularWindow,
+            visibleScreenFrame: screen
+        ).parkedFrame
+        let narrowParked = WorkspaceFloatingDockParkingSnapshot(
+            restoreFrame: narrowWindow,
+            visibleScreenFrame: screen
+        ).parkedFrame
 
         #expect(screen.intersection(regularParked).width == 24)
         #expect(screen.intersection(narrowParked).width == 16)
         #expect(regularParked.size == regularWindow.size)
         #expect(narrowParked.size == narrowWindow.size)
+    }
+
+    @Test
+    func parkingSnapshotKeepsExplicitRestoreRevealAndToleranceFrames() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let restoreFrame = CGRect(x: 240, y: 180, width: 620, height: 420)
+        let snapshot = WorkspaceFloatingDockParkingSnapshot(
+            restoreFrame: restoreFrame,
+            visibleScreenFrame: screen
+        )
+
+        #expect(snapshot.restoreFrame == restoreFrame)
+        #expect(screen.intersection(snapshot.parkedFrame).width == 24)
+        #expect(screen.intersection(snapshot.revealedFrame).width == 120)
+        #expect(snapshot.parkedFrame.size == restoreFrame.size)
+        #expect(snapshot.revealedFrame.size == restoreFrame.size)
+        #expect(snapshot.containsRevealedPoint(CGPoint(
+            x: snapshot.revealedFrame.minX - 10,
+            y: snapshot.revealedFrame.midY
+        )))
+        #expect(!snapshot.containsRevealedPoint(CGPoint(
+            x: snapshot.revealedFrame.minX - 16,
+            y: snapshot.revealedFrame.midY
+        )))
+    }
+
+    @Test
+    func parkingArrangesOverlappingWindowsIntoTargetableBands() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let restoreFrames = (0..<4).map { _ in
+            CGRect(x: 240, y: 180, width: 620, height: 420)
+        }
+
+        let snapshots = WorkspaceFloatingDockParkingSnapshot.arranged(
+            restoreFrames: restoreFrames,
+            visibleScreenFrame: screen
+        )
+
+        #expect(snapshots.count == restoreFrames.count)
+        for index in snapshots.indices.dropFirst() {
+            #expect(
+                snapshots[index].parkedFrame.minY
+                    - snapshots[index - 1].parkedFrame.minY
+                    == WorkspaceFloatingDockParkingSnapshot.preferredTargetHeight
+            )
+        }
+        #expect(snapshots.allSatisfy {
+            $0.parkedFrame.minY >= screen.minY && $0.parkedFrame.maxY <= screen.maxY
+        })
+    }
+
+    @Test
+    func parkingCompressesLargeStacksWithoutMovingAnyWindowOffscreen() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let restoreFrames = (0..<10).map { _ in
+            CGRect(x: 240, y: 180, width: 620, height: 420)
+        }
+
+        let snapshots = WorkspaceFloatingDockParkingSnapshot.arranged(
+            restoreFrames: restoreFrames,
+            visibleScreenFrame: screen
+        )
+
+        #expect(snapshots.count == restoreFrames.count)
+        #expect(snapshots.allSatisfy {
+            $0.parkedFrame.minY >= screen.minY && $0.parkedFrame.maxY <= screen.maxY
+        })
+        for index in snapshots.indices.dropFirst() {
+            #expect(snapshots[index].parkedFrame.minY > snapshots[index - 1].parkedFrame.minY)
+        }
     }
 }
